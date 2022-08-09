@@ -41,6 +41,10 @@ where
             tripped_until,
         }
     }
+
+    pub fn is_tripped(&self) -> bool {
+        self.tripped
+    }
 }
 
 impl<P, S, Req> Service<Req> for CircuitBreaker<P, S>
