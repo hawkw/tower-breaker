@@ -1,66 +1,263 @@
+use std::sync::{
+    atomic::{AtomicU64, AtomicUsize, Ordering},
+    Mutex,
+};
 use tokio::time::{Duration, Instant};
 
 #[derive(Debug)]
 pub struct WindowedCounter {
-    buckets: [i64; NUM_BUCKETS],
-    bucket_ms: u128,
-    epoch: Instant,
-    bucket: usize,
-}
+    anchor: Instant,
+    epoch: AtomicU64,
+    epoch_index: Mutex<usize>,
 
-const NUM_BUCKETS: usize = 8;
+    /// Buckets tracking the number of events counted over `1/NUM_BUCKETS` of
+    /// the time window.
+    buckets: [AtomicUsize; NUM_BUCKETS],
+
+    /// The fraction of the time window represented by one bucket, in
+    /// milliseconds.
+    bucket_window_ms: u64,
+
+    /// Writes to the current time slice, committed when expiring past buckets.
+    current: AtomicUsize,
+}
+const NUM_BUCKETS: usize = 10;
 
 impl WindowedCounter {
     pub fn new(window: Duration) -> Self {
+        // clippy doesn't like interior mutable items in `const`s, because
+        // mutating an instance of the `const` value will not mutate the const.
+        // that is the *correct* behavior here, as the const is used just as an
+        // array initializer; every time it's referenced, it *should* produce a
+        // new value. therefore, this warning is incorrect in this case.
+        //
+        // see https://github.com/rust-lang/rust-clippy/issues/7665
+        #[allow(clippy::declare_interior_mutable_const)]
+        const ATOMIC_USIZE_ZERO: AtomicUsize = AtomicUsize::new(0);
+
         WindowedCounter {
-            buckets: [0; NUM_BUCKETS],
-            bucket_ms: (window / NUM_BUCKETS as u32).as_millis(),
-            epoch: Instant::now(),
-            bucket: 0,
+            anchor: Instant::now(),
+            epoch: AtomicU64::new(0),
+            epoch_index: Mutex::new(0),
+            buckets: [ATOMIC_USIZE_ZERO; NUM_BUCKETS],
+            bucket_window_ms: (window / (NUM_BUCKETS) as u32).as_millis() as u64,
+            current: AtomicUsize::new(0),
         }
     }
-    pub fn add(&mut self, amount: i64) {
-        self.advance();
-        *self.curr_bucket() += amount;
+
+    pub fn add(&self, amount: usize) {
+        self.expire();
+        // TODO(eliza): probably doesn't need to be seqcst...
+        self.current.fetch_add(amount, Ordering::SeqCst);
     }
 
-    pub fn total(&mut self) -> i64 {
-        self.advance();
-        self.buckets.iter().sum()
+    pub fn sum(&self) -> usize {
+        self.expire();
+        let current = self.current.load(Ordering::SeqCst);
+        let prev: usize = self.buckets.iter().fold(0, |acc, bucket| {
+            acc.saturating_add(bucket.load(Ordering::SeqCst))
+        });
+        current.saturating_add(prev)
     }
 
-    pub fn clear(&mut self) {
-        self.buckets.fill(0);
-        self.epoch = Instant::now();
+    pub fn reset(&self) {
+        let mut epoch_index = self.epoch_index.lock().unwrap();
+        let my_epoch = self.anchor.elapsed().as_millis() as u64;
+        self.epoch.store(my_epoch, Ordering::SeqCst);
+        self.current.store(0, Ordering::SeqCst);
+        for bucket in &self.buckets {
+            bucket.store(0, Ordering::SeqCst);
+        }
+
+        *epoch_index = 0;
     }
 
-    #[inline]
-    fn curr_bucket(&mut self) -> &mut i64 {
-        &mut self.buckets[self.bucket]
-    }
+    /// Expire all counts outside the time window.
+    fn expire(&self) {
+        // the unchecked cast to `u64` is almost certainly fine here, since the
+        // duration is relative to the epoch anchor, which is the time this
+        // counter was created. if the time since the counter was created is
+        // `u64::MAX` milliseconds, that would be 1.8E16 seconds, or around 584
+        // million years.... if you're still running this code in 500 million
+        // years, you probably have worse problems...
+        let mut my_epoch = self.anchor.elapsed().as_millis() as u64;
+        let cur_epoch = self.epoch.load(Ordering::Acquire);
+        let mut delta = my_epoch - cur_epoch;
 
-    fn advance(&mut self) {
-        let now = Instant::now();
-        let elapsed_ms = now.duration_since(self.epoch).as_millis();
-
-        // we are still within the same bucket, do nothing.
-        if elapsed_ms < self.bucket_ms {
+        if delta < self.bucket_window_ms {
+            // still in the current epoch's bucket, we don't need to do
+            // anything requiring a lock.
             return;
         }
 
-        self.bucket = (self.bucket + 1) % NUM_BUCKETS;
-        let skipped = (((elapsed_ms / self.bucket_ms) - 1) as usize).min(NUM_BUCKETS);
-
-        // we advanced past more than one bucket, zero all the skipped buckets.
-        if skipped > 0 {
-            let skipped_right = skipped.min(NUM_BUCKETS - self.bucket);
-            self.buckets[self.bucket..self.bucket + skipped_right].fill(0);
-            let skipped_left = skipped - skipped_right;
-            self.buckets[..skipped_left].fill(0);
-            self.bucket = (self.bucket + skipped) % NUM_BUCKETS;
+        let mut epoch_index = self.epoch_index.lock().unwrap();
+        my_epoch = self.anchor.elapsed().as_millis() as u64;
+        match self
+            .epoch
+            .compare_exchange(cur_epoch, my_epoch, Ordering::AcqRel, Ordering::Acquire)
+        {
+            // advanced the epoch, time to actually expire old counts.
+            Ok(_) => {}
+            // someone else advanced the epoch while we were doing math, nothing
+            // else for us to do here...
+            Err(actual) => {
+                dbg!(actual);
+                return;
+            }
         }
 
-        *self.curr_bucket() = 0;
-        self.epoch = now;
+        // commit all the writes in the current bucket
+        let to_commit = self.current.swap(0, Ordering::SeqCst);
+        self.buckets[*epoch_index].store(to_commit, Ordering::SeqCst);
+
+        // clear all the buckets that we've passed over based on the elapsed
+        // time delta.
+        let mut i = (*epoch_index + 1) % NUM_BUCKETS;
+        while delta > self.bucket_window_ms {
+            self.buckets[i].store(0, Ordering::SeqCst);
+            delta -= self.bucket_window_ms;
+            i = (i + 1) % NUM_BUCKETS;
+        }
+
+        // always zero the current bucket, since its count will be stored in
+        // `self.current`, rather than in the bucket itself.
+        self.buckets[i].store(0, Ordering::SeqCst);
+        *epoch_index = i;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::time;
+
+    fn counter() -> WindowedCounter {
+        WindowedCounter::new(time::Duration::from_secs(3))
+    }
+
+    // fn dump(ctr: &WindowedCounter) {
+    //     use std::fmt;
+
+    //     struct DebugBuckets<'a>(&'a WindowedCounter);
+
+    //     impl fmt::Debug for DebugBuckets<'_> {
+    //         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    //             f.debug_list()
+    //                 .entries(
+    //                     self.0
+    //                         .buckets
+    //                         .iter()
+    //                         .map(|bucket| bucket.load(Ordering::SeqCst)),
+    //                 )
+    //                 .finish()
+    //         }
+    //     }
+
+    //     println!(
+    //         "\nepoch: {}\nepoch_index: {}\ncurrent: {}\nbuckets: {:?}\n",
+    //         ctr.epoch.load(Ordering::SeqCst),
+    //         *ctr.epoch_index.lock().unwrap(),
+    //         ctr.current.load(Ordering::SeqCst),
+    //         DebugBuckets(ctr)
+    //     );
+    // }
+
+    #[tokio::test]
+    async fn sum_no_sliding() {
+        time::pause();
+        let ctr = counter();
+
+        ctr.add(1);
+        assert_eq!(1, ctr.sum());
+        ctr.add(1);
+        assert_eq!(2, ctr.sum());
+        ctr.add(3);
+        assert_eq!(5, ctr.sum());
+    }
+
+    #[tokio::test]
+    async fn sliding_short_window() {
+        time::pause();
+        let ctr = counter();
+
+        dbg!(ctr.add(1));
+        assert_eq!(1, dbg!(ctr.sum()));
+
+        dbg!(time::advance(Duration::from_secs(1)).await);
+        assert_eq!(1, dbg!(ctr.sum()));
+
+        dbg!(ctr.add(2));
+        assert_eq!(3, dbg!(ctr.sum()));
+
+        dbg!(time::advance(Duration::from_secs(1)).await);
+        assert_eq!(3, dbg!(ctr.sum()));
+
+        dbg!(time::advance(Duration::from_secs(1)).await);
+        assert_eq!(2, dbg!(ctr.sum()));
+
+        dbg!(time::advance(Duration::from_secs(1)).await);
+        assert_eq!(0, dbg!(ctr.sum()));
+    }
+
+    #[tokio::test]
+    async fn sliding_over_large_window() {
+        time::pause();
+        let ctr = WindowedCounter::new(Duration::from_secs(20));
+
+        for i in 0..21 {
+            ctr.add(dbg!(i % 3));
+            dbg!(time::advance(Duration::from_secs(1)).await);
+        }
+
+        assert_eq!(20, dbg!(ctr.sum()));
+
+        dbg!(time::advance(Duration::from_secs(1)).await);
+        assert_eq!(18, dbg!(ctr.sum()));
+
+        dbg!(time::advance(Duration::from_secs(1)).await);
+        assert_eq!(18, dbg!(ctr.sum()));
+
+        dbg!(time::advance(Duration::from_secs(5)).await);
+        assert_eq!(12, dbg!(ctr.sum()));
+        dbg!(ctr.add(1));
+
+        dbg!(time::advance(Duration::from_secs(10)).await);
+        assert_eq!(3, dbg!(ctr.sum()));
+    }
+
+    #[tokio::test]
+    async fn sliding_past_empty_buckets() {
+        time::pause();
+        let ctr = counter();
+
+        dbg!(ctr.add(1));
+        assert_eq!(1, dbg!(ctr.sum()));
+
+        dbg!(time::advance(Duration::from_secs(1)).await);
+        dbg!(ctr.add(2));
+        assert_eq!(3, dbg!(ctr.sum()));
+
+        dbg!(time::advance(Duration::from_secs(1)).await);
+        dbg!(ctr.add(1));
+        assert_eq!(4, dbg!(ctr.sum()));
+
+        dbg!(time::advance(Duration::from_secs(2)).await);
+        assert_eq!(1, dbg!(ctr.sum()));
+
+        dbg!(time::advance(Duration::from_secs(100)).await);
+        assert_eq!(0, dbg!(ctr.sum()));
+
+        dbg!(ctr.add(100));
+        dbg!(time::advance(Duration::from_secs(1)).await);
+        assert_eq!(100, dbg!(ctr.sum()));
+
+        dbg!(ctr.add(100));
+        dbg!(time::advance(Duration::from_secs(1)).await);
+
+        dbg!(ctr.add(100));
+        assert_eq!(300, dbg!(ctr.sum()));
+
+        dbg!(time::advance(Duration::from_secs(100)).await);
+        assert_eq!(0, dbg!(ctr.sum()));
     }
 }

@@ -1,9 +1,9 @@
 use crate::window_counter::WindowedCounter;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use tokio::time::Duration;
 
 #[derive(Clone, Debug)]
-pub struct SlidingFailureRate(Arc<Mutex<Inner>>);
+pub struct SlidingFailureRate(Arc<Inner>);
 
 #[derive(Debug)]
 struct Inner {
@@ -26,35 +26,33 @@ impl SlidingFailureRate {
             (0.0..=0.1).contains(&max_rate),
             "maximum failure rate ({max_rate}) must be in the range [0, 1] "
         );
-        SlidingFailureRate(Arc::new(Mutex::new(Inner {
+        SlidingFailureRate(Arc::new(Inner {
             max_rate,
             reqs: WindowedCounter::new(window),
             fails: WindowedCounter::new(window),
-        })))
+        }))
     }
 }
 
 impl super::Policy for SlidingFailureRate {
     fn record_success(&self) {
-        self.0.lock().unwrap().reqs.add(1);
+        self.0.reqs.add(1);
     }
 
     fn record_failure(&self) {
-        let mut inner = self.0.lock().unwrap();
-        inner.fails.add(1);
-        inner.reqs.add(1);
+        self.0.reqs.add(1);
+        self.0.fails.add(1);
     }
 
     fn is_punished(&self) -> bool {
-        let mut inner = self.0.lock().unwrap();
-        let reqs = inner.reqs.total();
-        let fails = inner.fails.total();
+        let reqs = self.0.reqs.sum();
+        let fails = self.0.fails.sum();
         let rate = fails as f64 / reqs as f64;
-        let punished = rate > inner.max_rate;
+        let punished = rate > self.0.max_rate;
         if punished {
             tracing::trace!(
                 failure_rate = rate,
-                max_rate = inner.max_rate,
+                max_rate = self.0.max_rate,
                 "Failure rate exceeds max; punishing endpoint!"
             );
         }
@@ -62,8 +60,7 @@ impl super::Policy for SlidingFailureRate {
     }
 
     fn reset(&self) {
-        let mut inner = self.0.lock().unwrap();
-        inner.reqs.clear();
-        inner.fails.clear();
+        self.0.reqs.reset();
+        self.0.fails.reset();
     }
 }
